@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_NAME="${1:-}"
+PY_VERSION="${2:-}"
+
+if [[ -z "$PROJECT_NAME" ]]; then
+  echo "Usage: new-python-project <project_name> [python_version]"
+  exit 1
+fi
+
+# pyenv setup
+export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+export PATH="$PYENV_ROOT/bin:$PATH"
+
+if ! command -v pyenv >/dev/null; then
+  echo "pyenv not found"
+  exit 1
+fi
+
+eval "$(pyenv init --path)"
+eval "$(pyenv init -)"
+
+# uv check
+if ! command -v uv >/dev/null; then
+  echo "uv not found"
+  exit 1
+fi
+
+# Resolve latest Python if not specified
+if [[ -z "$PY_VERSION" ]]; then
+  echo "Resolving latest Python version via pyenv..."
+  PY_VERSION="$(pyenv install --list \
+    | sed 's/^[[:space:]]*//' \
+    | grep -E '^3\.[0-9]+\.[0-9]+$' \
+    | tail -1)"
+fi
+
+echo "Creating project '$PROJECT_NAME' with Python $PY_VERSION"
+
+pyenv install -s "$PY_VERSION"
+
+mkdir -p "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+pyenv local "$PY_VERSION"
+
+uv init --python "$PY_VERSION" .
+
+mkdir -p src
+cat > src/main.py <<EOF
+def main():
+    print("Hello from $PROJECT_NAME")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+uv add --dev pytest ruff
+uv lock
+uv sync
+
+git init
+git add .
+git commit -m "Initial project scaffold"
+
+echo
+echo "Project ready."
+echo "Run:"
+echo "  cd $PROJECT_NAME"
+echo "  uv run src/main.py"
+

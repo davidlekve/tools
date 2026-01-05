@@ -7,16 +7,12 @@ This repository follows a standard Unix-friendly pattern:
 - Executables are exposed via `~/.local/bin`
 - Installation uses symlinks (no copying)
 
----
-
 ## Requirements
 
 - `~/.local/bin` must be on your `PATH`
 - For `new-python-project`:
   - `pyenv`
   - `uv`
-
----
 
 ## Installation
 
