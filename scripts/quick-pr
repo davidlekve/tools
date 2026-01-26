@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}→${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}!${NC} $1"; }
+log_error() { echo -e "${RED}✗${NC} $1" >&2; }
+
+# Temp files for patches
+REMAINING_PATCH=""
+CLEANUP_FILES=()
+
+cleanup() {
+  local exit_code=$?
+
+  # Clean up temp files
+  for f in "${CLEANUP_FILES[@]:-}"; do
+    rm -f "$f" 2>/dev/null || true
+  done
+
+  if [[ $exit_code -ne 0 && -n "${ORIGINAL_BRANCH:-}" ]]; then
+    log_warn "Restoring original branch: $ORIGINAL_BRANCH"
+    git checkout "$ORIGINAL_BRANCH" 2>/dev/null || true
+    if [[ -n "${NEW_BRANCH:-}" ]]; then
+      git branch -D "$NEW_BRANCH" 2>/dev/null || true
+    fi
+    if [[ "${STASHED:-false}" == "true" ]]; then
+      log_warn "Restoring stashed changes..."
+      git stash pop 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<EOF
+Usage: quick-pr <files...>
+
+Create a PR with auto-generated branch name, commit message, and PR title.
+
+Arguments:
+  <files...>    Files to include (supports git add syntax)
+                Examples:
+                  quick-pr -              # Currently staged changes only
+                  quick-pr .              # All changes
+                  quick-pr -A             # All changes (including untracked)
+                  quick-pr src/           # Directory
+                  quick-pr file1.ts file2.ts
+
+Requirements:
+  - gh (GitHub CLI) authenticated
+  - claude (Claude Code CLI)
+  - Git repository with remote 'origin'
+
+The PR title follows: <type>: description in lowercase
+Types: feat, fix, refactor, docs, test, chore, perf, ci
+EOF
+  exit 1
+}
+
+# Validate arguments
+if [[ $# -eq 0 ]]; then
+  usage
+fi
+
+# Check required tools
+for cmd in git gh claude; do
+  if ! command -v "$cmd" &>/dev/null; then
+    log_error "Required tool not found: $cmd"
+    exit 1
+  fi
+done
+
+# Verify we're in a git repo
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  log_error "Not inside a git repository"
+  exit 1
+fi
+
+# Check for remote
+if ! git remote get-url origin &>/dev/null; then
+  log_error "No 'origin' remote configured"
+  exit 1
+fi
+
+# Check gh authentication
+if ! gh auth status &>/dev/null; then
+  log_error "GitHub CLI not authenticated. Run: gh auth login"
+  exit 1
+fi
+
+# Save current state
+ORIGINAL_BRANCH=$(git branch --show-current)
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Detect main branch name
+MAIN_BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}')
+if [[ -z "$MAIN_BRANCH" ]]; then
+  if git show-ref --verify --quiet refs/remotes/origin/main; then
+    MAIN_BRANCH="main"
+  elif git show-ref --verify --quiet refs/remotes/origin/master; then
+    MAIN_BRANCH="master"
+  else
+    log_error "Could not detect main branch"
+    exit 1
+  fi
+fi
+
+log_info "Main branch: $MAIN_BRANCH"
+
+# Determine mode and save patches for what should REMAIN after PR
+FILES_ARG=("$@")
+USE_STAGED_ONLY=false
+COMMIT_PATCH=""
+REMAINING_PATCH=$(mktemp)
+CLEANUP_FILES+=("$REMAINING_PATCH")
+
+if [[ "${FILES_ARG[0]}" == "-" ]]; then
+  # Staged-only mode: commit staged, keep unstaged
+  USE_STAGED_ONLY=true
+  if git diff --cached --quiet; then
+    log_error "No changes currently staged. Stage files with 'git add' first."
+    exit 1
+  fi
+  log_info "Using currently staged changes..."
+  COMMIT_PATCH=$(git diff --cached)
+  # Save unstaged changes to restore later
+  git diff > "$REMAINING_PATCH"
+
+elif [[ "${FILES_ARG[0]}" == "-A" ]]; then
+  # All changes including untracked: nothing remains
+  : > "$REMAINING_PATCH"
+
+elif [[ "${FILES_ARG[0]}" == "." ]]; then
+  # All tracked changes: nothing remains (untracked files are untouched by git)
+  : > "$REMAINING_PATCH"
+
+else
+  # Specific files: save changes to OTHER files
+  # Build exclude pattern for the files being committed
+  EXCLUDE_ARGS=()
+  for f in "${FILES_ARG[@]}"; do
+    EXCLUDE_ARGS+=(":!$f")
+  done
+  # Save staged changes to other files
+  git diff --cached -- "${EXCLUDE_ARGS[@]}" > "$REMAINING_PATCH" 2>/dev/null || true
+  # Append unstaged changes to other files
+  git diff -- "${EXCLUDE_ARGS[@]}" >> "$REMAINING_PATCH" 2>/dev/null || true
+fi
+
+# Stash everything to get a clean state
+STASHED=false
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  log_info "Stashing current changes..."
+  git stash push -m "quick-pr-temp-stash" --include-untracked
+  STASHED=true
+fi
+
+# Fetch and update main
+log_info "Fetching latest from origin..."
+git fetch origin "$MAIN_BRANCH" --quiet
+
+# Checkout fresh main
+log_info "Preparing changes..."
+git checkout "origin/$MAIN_BRANCH" --quiet --detach
+
+if [[ "$USE_STAGED_ONLY" == "true" ]]; then
+  # Apply the saved staged patch
+  echo "$COMMIT_PATCH" | git apply --index || {
+    log_error "Failed to apply staged changes to fresh main"
+    git checkout "$ORIGINAL_BRANCH" --quiet
+    if [[ "$STASHED" == "true" ]]; then
+      git stash pop --quiet || true
+    fi
+    exit 1
+  }
+else
+  # Restore stashed changes
+  if [[ "$STASHED" == "true" ]]; then
+    git stash pop --quiet || {
+      log_error "Failed to restore stashed changes"
+      exit 1
+    }
+    STASHED=false  # Mark as consumed
+  fi
+
+  # Stage the specified files
+  if [[ "${FILES_ARG[0]}" == "-A" ]]; then
+    git add -A
+  elif [[ "${FILES_ARG[0]}" == "." ]]; then
+    git add .
+  else
+    git add "${FILES_ARG[@]}"
+  fi
+
+  # Check if there are staged changes
+  if git diff --cached --quiet; then
+    log_error "No changes staged for commit"
+    git checkout "$ORIGINAL_BRANCH" --quiet
+    exit 1
+  fi
+fi
+
+# Get the diff for Claude to analyze
+DIFF=$(git diff --cached --stat && echo "---" && git diff --cached)
+
+# Limit diff size for context (first 8000 chars)
+if [[ ${#DIFF} -gt 8000 ]]; then
+  DIFF="${DIFF:0:8000}
+
+[diff truncated...]"
+fi
+
+log_info "Generating branch name, commit message, and PR title..."
+
+# Use Claude to generate everything in one call
+CLAUDE_OUTPUT=$(claude --model haiku --print <<EOF
+Analyze this git diff and generate:
+1. A branch name (kebab-case, max 50 chars, no special chars except hyphens)
+2. A commit message (conventional commit format, first line max 72 chars)
+3. A PR title (format: "<type>: description" where description is all lowercase)
+4. A PR description (1-3 sentences explaining WHY these changes were made, not what changed)
+
+Types: feat, fix, refactor, docs, test, chore, perf, ci
+
+IMPORTANT: Output ONLY in this exact format with these exact labels:
+BRANCH: <branch-name>
+COMMIT: <commit-message>
+TITLE: <pr-title>
+DESCRIPTION: <pr-description>
+
+Diff:
+$DIFF
+EOF
+)
+
+# Parse Claude's output
+BRANCH_NAME=$(echo "$CLAUDE_OUTPUT" | grep -E '^BRANCH:' | sed 's/^BRANCH:[[:space:]]*//' | head -1)
+COMMIT_MSG=$(echo "$CLAUDE_OUTPUT" | grep -E '^COMMIT:' | sed 's/^COMMIT:[[:space:]]*//' | head -1)
+PR_TITLE=$(echo "$CLAUDE_OUTPUT" | grep -E '^TITLE:' | sed 's/^TITLE:[[:space:]]*//' | head -1)
+PR_BODY=$(echo "$CLAUDE_OUTPUT" | grep -E '^DESCRIPTION:' | sed 's/^DESCRIPTION:[[:space:]]*//' | head -1)
+
+# Validate outputs
+if [[ -z "$BRANCH_NAME" || -z "$COMMIT_MSG" || -z "$PR_TITLE" ]]; then
+  log_error "Failed to parse Claude output"
+  log_error "Output was: $CLAUDE_OUTPUT"
+  git checkout "$ORIGINAL_BRANCH" --quiet
+  if [[ "$STASHED" == "true" ]]; then
+    git stash pop --quiet || true
+  fi
+  exit 1
+fi
+
+# Sanitize branch name
+BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//' | cut -c1-50)
+
+# Ensure PR title is lowercase after the type
+PR_TYPE=$(echo "$PR_TITLE" | cut -d: -f1)
+PR_DESC=$(echo "$PR_TITLE" | cut -d: -f2- | sed 's/^[[:space:]]*//' | tr '[:upper:]' '[:lower:]')
+PR_TITLE="$PR_TYPE: $PR_DESC"
+
+# Check if branch already exists
+if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+  BRANCH_NAME="${BRANCH_NAME}-$(date +%s | tail -c 5)"
+  log_warn "Branch existed, using: $BRANCH_NAME"
+fi
+
+# Create and checkout the new branch
+NEW_BRANCH="$BRANCH_NAME"
+git checkout -b "$NEW_BRANCH" --quiet
+log_success "Created branch: $NEW_BRANCH"
+
+# Commit
+git commit -m "$COMMIT_MSG" --quiet
+log_success "Committed changes"
+
+# Push
+log_info "Pushing to origin..."
+git push -u origin "$NEW_BRANCH" --quiet
+log_success "Pushed to origin/$NEW_BRANCH"
+
+# Create PR
+log_info "Creating pull request..."
+PR_URL=$(gh pr create \
+  --title "$PR_TITLE" \
+  --body "${PR_BODY:-}" \
+  --base "$MAIN_BRANCH" \
+  --head "$NEW_BRANCH" \
+  2>&1)
+
+log_success "Pull request created!"
+
+# Restore original branch
+log_info "Restoring working state..."
+git checkout "$ORIGINAL_BRANCH" --quiet
+
+# Drop stash if still exists (wasn't consumed)
+if [[ "$STASHED" == "true" ]]; then
+  git stash drop --quiet 2>/dev/null || true
+fi
+
+# Apply remaining changes (changes that weren't part of the PR)
+if [[ -s "$REMAINING_PATCH" ]]; then
+  git apply "$REMAINING_PATCH" 2>/dev/null || true
+  log_success "Restored uncommitted changes"
+else
+  log_success "Working directory clean"
+fi
+
+# Summary
+echo
+echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}PR Created Successfully${NC}"
+echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
+echo
+echo -e "  ${BLUE}Branch:${NC}      $NEW_BRANCH"
+echo -e "  ${BLUE}Commit:${NC}      $COMMIT_MSG"
+echo -e "  ${BLUE}Title:${NC}       $PR_TITLE"
+if [[ -n "${PR_BODY:-}" ]]; then
+  echo -e "  ${BLUE}Description:${NC} $PR_BODY"
+fi
+echo
+echo -e "  ${GREEN}$PR_URL${NC}"
+echo
