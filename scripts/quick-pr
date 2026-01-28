@@ -118,6 +118,26 @@ log_info "Main branch: $MAIN_BRANCH"
 # Determine mode and save patches for what should REMAIN after PR
 FILES_ARG=("$@")
 USE_STAGED_ONLY=false
+
+# Check for untracked files (problematic for all modes except -A)
+if [[ "${FILES_ARG[0]}" != "-A" ]]; then
+  UNTRACKED_FILES=$(git ls-files --others --exclude-standard)
+  if [[ -n "$UNTRACKED_FILES" ]]; then
+    log_warn "Untracked files detected:"
+    echo "$UNTRACKED_FILES" | head -10 | sed 's/^/  /'
+    UNTRACKED_COUNT=$(echo "$UNTRACKED_FILES" | wc -l)
+    if [[ "$UNTRACKED_COUNT" -gt 10 ]]; then
+      echo "  ... and $((UNTRACKED_COUNT - 10)) more"
+    fi
+    echo
+    log_error "Untracked files would be lost by this operation."
+    log_info "Options:"
+    echo "  - Use 'quick-pr -A' to include untracked files in the PR"
+    echo "  - Stage/commit untracked files first"
+    echo "  - Add files to .gitignore if they shouldn't be tracked"
+    exit 1
+  fi
+fi
 COMMIT_PATCH=""
 REMAINING_PATCH=$(mktemp)
 CLEANUP_FILES+=("$REMAINING_PATCH")
